@@ -5,6 +5,6 @@ the script can be run stand-alone on any linux machine with borg, jq, and rclone
 ```
 docker run -v <home-dir>:/home/ubuntu mlgrm/drive-to-borg \
     [--my-drive] [--team-drives] [--shared-with-me] [--folder <folder-id>>]
- \```
+ ```
 
 see https://gist.github.com/mlgrm/5ecb9012a8d54590bbedbfcb9b03acdb for setup info to use the google api.
