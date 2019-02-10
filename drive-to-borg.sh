@@ -9,6 +9,9 @@ die () {
     warn "$@"
     exit $rc
 }
+message () {
+    (>&2 $@)
+}
 vcat () {
     printf "%s" $@
 }
@@ -60,6 +63,9 @@ do
     esac
 done
 
+set -- ${POSITIONAL[@]}
+if [[ $# -ne 0 ]]; then die 1 "unrecognized args: $@"; fi
+
 # if you don't have a TOKEN, try the first one in your rclone.conf
 if [[ -z $TOKEN && -f $HOME/.config/rclone/rclone.conf ]] &&
     grep -qE '^token = ' $HOME/.config/rclone/rclone.conf; then
@@ -69,7 +75,7 @@ fi
 
 # if we're running on a google compute instance, the TOKEN might be in the
 # project metadata
-if [[ -z $TOKEN ]] && curl metadata.google.internal; then
+if [[ -z $TOKEN ]] && curl -s metadata.google.internal > /dev/null; then
     TOKEN=$(curl -s $(vcat metadata.google.internal/ \
         computeMetadata/v1/project/attributes/rclone-token) \
         -H "Metadata-flavor: Google")
@@ -115,6 +121,7 @@ if [[ ${#DIRS[@]} -gt 0 ]]; then
     fi
     conf=$(tempfile)
     printf "%s\n" "${conf_lines[@]}" > $conf
+    message "synching folder $name to to $prefix/$name ($id)..."
     rclone --config $conf sync dir: "$prefix/$name ($id)"
 done
 fi
@@ -129,6 +136,7 @@ if [[ $MY_DRIVE = "true" ]]; then
     )
     conf=$(tempfile)
     printf "%s\n" "${conf_lines[@]}" > $conf
+    message "synching My Drive to to my-drive/..."
     rclone --config $conf sync dir: my-drive
 fi
 
@@ -143,12 +151,12 @@ if [[ $SHARED_WITH_ME = "true" ]]; then
     )
     conf=$(tempfile)
     printf "%s\n" "${conf_lines[@]}" > $conf
+    message "synching Shared with me to to shared-with-me/..."
     rclone --config $conf sync dir: shared-with-me
 fi
 
 # team drives
 
-# get all team drive ids
 for entry in $(
     ./google-api /drive/v3/teamdrives \
         useDomainAdminAccess=true \
@@ -180,6 +188,7 @@ for entry in $(
     'team_drive = $id'
     )
     printf "%s\n" "${conf_lines[@]}"
+    message "synching $name to team-drives/$name ($id)/..."
     rclone --config $conf sync dir: "$name ($id)"/
     # if our perm is new, delete it.
     if ! grep -q "^$perm_id$" <<< $old_ids; then
@@ -190,10 +199,27 @@ for entry in $(
 done
 
 # if the repo doesn't exist, create it
-BORG_KEY_FILE=$HOME/$(basename $REPO).key borg \
-    --remote-path borg1 \
-    init -e keyfile $REPO
+login=$(sed -e 's/^\([^\/]*\).*$/\1/' <<< $REPO)
+if ssh $login ls -d $(basename $REPO); then
+    BORG_KEY_FILE=$HOME/$(basename $REPO).key borg \
+        --remote-path borg1 \
+        init -e keyfile $REPO
 
+    # if we're on gce, upload it to metadata
+    if curl -s metadata.google.internal > /dev/null; then
+        project_id=$(curl -s \
+            $(vcat "metadata.google.internal/computeMetadata/" \
+            "v1/project/project-id") \
+            -H 'Metadata-flavor: Google')
+        # get instance metadata
+        # TODO: get token with compute scope and use it to get
+        # the instance fingerprint, then use that to set the borg-key
+        # in the project metadata
+    fi
+fi
+
+archive=$(date +%Y%m%d%H%M%S)
+message "backing up to $REPO::$archive"
 BORG_KEY_FILE=$HOME/$(basename $REPO).key borg \
     --remote-path borg1 \
-    create -s --json $REPO::$(date +%Y%m%d%H%M%S)
+    create -s --json $REPO::$archive
