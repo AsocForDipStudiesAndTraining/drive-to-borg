@@ -173,8 +173,8 @@ for entry in $(
         jq -cr '.permissions[].id'
     )
     # create a permission if necessary
-    ./perm_id=$(
-    google-api -X POST /drive/v3/files/$id/permissions \
+    perm_id=$(
+    ./google-api -X POST /drive/v3/files/$id/permissions \
         supportsTeamDrives=true \
         useDomainAdminAccess=true \
         -p '{"role":"reader","type":"user","emailAddress":"'$EMAIL'}' |
