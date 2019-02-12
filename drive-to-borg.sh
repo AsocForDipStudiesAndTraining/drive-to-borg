@@ -16,6 +16,51 @@ vcat () {
     printf "%s" $@
 }
 
+update_metadata () {
+    project_id=$(curl -s \
+        metadata.google.internal/computeMetadata/v1/project/project-id \
+        -H 'Metadata-flavor: Google'
+    )
+    IFS='=' read -r key junk <<< $1
+    # remove the key and any leading or trailing quotes made by jq -sR
+    value=$(sed -e "1 s/$key=//" -e '1 s/^"//' -e '$ s/"$//' <<< $1)
+    new_entry=$(jq -n "{ \"$key\": \"$value\" } | to_entries") ||
+        return 1 #die 1 "failed to parse argument"
+    new_metadata=$(./google-api /compute/v1/projects/$project_id |
+        jq '.commonInstanceMetadata' |
+        # only keep fingerprint and items
+        jq 'with_entries(select(.key == "fingerprint" or .key == "items"))' |
+        # remove the item with this key if it exists
+        jq "del(.items[] | select( .key == ($new_entry | .[0].key) ))" |
+        # add new item to the list
+        jq ".items += $new_entry"
+    ) || return 1 #die 1 "failed to process new metadata"
+    ./google-api -X POST \
+        /compute/v1/projects/$project_id/setCommonInstanceMetadata \
+        -p "$new_metadata"
+}
+
+add_borg_key () {
+    remote=$1
+    keyfile=$2
+    if ! keylist=$(
+    curl -s -H "Metadata-flavor: Google" $(vcat \
+        "metadata.google.internal/computeMetadata/" \
+        "v1/project/attributes/borg-keys")
+    ); then keylist='[]'; fi
+    [[ -z $keylist ]] && keylist="[]"
+    json=$(jq -nc $( vcat \
+    "[ " \
+    ".remote = \"$remote\" | " \
+    ".\"file-name\" = \"$(basename $keyfile)\" | " \
+    ".key = \"$(< $keyfile)\"" \
+    " ]")
+    )
+    keylist=$(jq ". += $json" <<< $keylist | jq -sR '.')
+    update_metadata "borg-keys=$keylist"
+}
+
+
 POSITIONAL=()
 while [[ $# -gt 0 ]]
 do
@@ -207,14 +252,7 @@ if ssh $login ls -d $(basename $REPO); then
 
     # if we're on gce, upload it to metadata
     if curl -s metadata.google.internal > /dev/null; then
-        project_id=$(curl -s \
-            $(vcat "metadata.google.internal/computeMetadata/" \
-            "v1/project/project-id") \
-            -H 'Metadata-flavor: Google')
-        # get instance metadata
-        # TODO: get token with compute scope and use it to get
-        # the instance fingerprint, then use that to set the borg-key
-        # in the project metadata
+        update_metada "borg-key=$(< $BORG_KEY_FILE)"
     fi
 fi
 
