@@ -1,5 +1,62 @@
 #!/bin/bash
+#
+# drive-to-borg: a simple script to sync google drive folders and
+# team drives, then back them up with borg
+#
+# for a production environment, this script is intended to be run
+# in a container running on a host in google's compute platform, storing
+# secrets and keys in the project metadata
 
+set -e
+
+#############
+# FUNCTIONS #
+#############
+
+usage() { printf "%s" "
+Usage:
+
+drive-to-borg [--option [\"value\"] [...]]
+docker run [docker-options] mlgrm/drive-to-borg [--option [\"value\"] [...]]
+
+Options:
+    -f, --folder-id FOLDER_ID
+            id of a drive or team drive folder to back up. Use once for each
+            folder
+
+    -m, --my-drive
+            back-up everything in \"My Drive\"
+
+    -s, --shared-with-me
+            back-up everything in \"Shared with me\"
+
+    -t, --team-drives
+            back-up all the team drives you are a member of, or if you are a
+            domain admin, all team drives
+
+    --token TOKEN
+            a json string containing a valid set of token values from rclone
+
+    --token-file FILE_NAME
+            a json file containing a valid rclone token.  for docker, the
+            file must be available from /home/ubuntu on the container's file
+            system
+
+    -r, --repo REPOSITORY
+            a fully qualified borg repository location.  for remote
+            repositories, it should be of the form:
+            ssh://user@server/path/to/repo
+
+    --borg-key-file KEYFILE
+            if you have a local keyfile, you can specify it here. for docker,
+            the file must be available from /home/ubuntu on the container's
+            file system
+
+    --help
+            print this message and exit
+"
+    exit 0
+}
 warn () {
     echo "$0:" "$@" >&2
 }
@@ -10,10 +67,7 @@ die () {
     exit $rc
 }
 message () {
-    (>&2 $@)
-}
-vcat () {
-    printf "%s" $@
+    (>&2 echo $@)
 }
 
 update_metadata () {
@@ -21,9 +75,9 @@ update_metadata () {
         metadata.google.internal/computeMetadata/v1/project/project-id \
         -H 'Metadata-flavor: Google'
     )
-    IFS='=' read -r key junk <<< $1
-    # remove the key and any leading or trailing quotes made by jq -sR
-    value=$(sed -e "1 s/$key=//" -e '1 s/^"//' -e '$ s/"$//' <<< $1)
+    IFS='=' read -rd '' key value <<< $1
+    # remove any leading and trailing quotes made by jq -sR
+    value=$(sed -e '1 s/^"//' -e '$ s/"$//' <<< $1)
     new_entry=$(jq -n "{ \"$key\": \"$value\" } | to_entries") ||
         return 1 #die 1 "failed to parse argument"
     new_metadata=$(./google-api /compute/v1/projects/$project_id |
@@ -41,27 +95,25 @@ update_metadata () {
 }
 
 add_borg_key () {
-    remote=$1
+    repo=$1
     keyfile=$2
     if ! keylist=$(
-    curl -s -H "Metadata-flavor: Google" $(vcat \
-        "metadata.google.internal/computeMetadata/" \
-        "v1/project/attributes/borg-keys")
+    curl -s -H "Metadata-flavor: Google" \
+        $project_metadata/borg-keys
     ); then keylist='[]'; fi
     [[ -z $keylist ]] && keylist="[]"
-    json=$(jq -nc $( vcat \
-    "[ " \
-    ".remote = \"$remote\" | " \
-    ".\"file-name\" = \"$(basename $keyfile)\" | " \
-    ".key = \"$(< $keyfile)\"" \
-    " ]")
-    )
+    json=$(jq -nc "[ .remote = \"$repo\" | .key = \"$(< $keyfile)\" ]")
     keylist=$(jq ". += $json" <<< $keylist | jq -sR '.')
     update_metadata "borg-keys=$keylist"
 }
 
 
+#########
+# FLAGS #
+#########
+
 POSITIONAL=()
+DIRS=()
 while [[ $# -gt 0 ]]
 do
     key="$1"
@@ -101,6 +153,22 @@ do
             shift
             ;;
 
+        -r|--repo)
+            REPO=$2
+            shift
+            shift
+            ;;
+
+        --borg-key-file)
+            BORG_KEY_FILE=$2
+            shift
+            shift
+            ;;
+
+        --help)
+            usage
+            ;;
+
         *)
             POSITIONAL+=($key)
             shift
@@ -111,6 +179,12 @@ done
 set -- ${POSITIONAL[@]}
 if [[ $# -ne 0 ]]; then die 1 "unrecognized args: $@"; fi
 
+
+
+########
+# SYNC #
+########
+
 # if you don't have a TOKEN, try the first one in your rclone.conf
 if [[ -z $TOKEN && -f $HOME/.config/rclone/rclone.conf ]] &&
     grep -qE '^token = ' $HOME/.config/rclone/rclone.conf; then
@@ -120,9 +194,9 @@ fi
 
 # if we're running on a google compute instance, the TOKEN might be in the
 # project metadata
+proj_metadata="metadata.google.internal/computeMetadata/v1/project/attributes"
 if [[ -z $TOKEN ]] && curl -s metadata.google.internal > /dev/null; then
-    TOKEN=$(curl -s $(vcat metadata.google.internal/ \
-        computeMetadata/v1/project/attributes/rclone-token) \
+    TOKEN=$(curl -s $proj_metadata/rclone-token \
         -H "Metadata-flavor: Google")
 fi
 
@@ -130,8 +204,8 @@ fi
 if [[ -z $TOKEN ]]; then die 1 "can't find a token for rclone"; fi
 
 # get google-api script if not present
-if [[ ! -f google-api ]]; then
-    curl -sl http://bit.ly/mlgrm-google-api > google-api
+if [[ ! -x google-api ]]; then
+    curl -sL http://bit.ly/mlgrm-google-api > google-api
     chmod +x google-api
 fi
 
@@ -154,7 +228,7 @@ if [[ ${#DIRS[@]} -gt 0 ]]; then
         )
     else
         mkdir -p folders
-        name=$(google-api /drive/v3/files/$id | jq -r .name)
+        name=$(./google-api /drive/v3/files/$id | jq -r .name)
         prefix="folders"
         conf_lines=(
         '[dir]'
@@ -202,62 +276,81 @@ fi
 
 # team drives
 
-for entry in $(
-    ./google-api /drive/v3/teamdrives \
-        useDomainAdminAccess=true \
-        -l teamDrives | \
-        jq -c .teamDrives[]
-    ); do
-    name=$(jq -r .name <<< $entry)
-    id=$(jq -r .id <<< $entry)
-    # check the permissions
-    old_ids=$(
-    ./google-api /drive/v3/files/$id/permissions \
-        supportsTeamDrives=true \
-        useDomainAdminAccess=true |
-        jq -cr '.permissions[].id'
-    )
-    # create a permission if necessary
-    perm_id=$(
-    ./google-api -X POST /drive/v3/files/$id/permissions \
-        supportsTeamDrives=true \
-        useDomainAdminAccess=true \
-        -p '{"role":"reader","type":"user","emailAddress":"'$EMAIL'}' |
-        jq -r '.id'
-    )
-    conf_lines=(
-    '[dir]'
-    'type = drive'
-    'scope = drive.readonly'
-    'token = $TOKEN'
-    'team_drive = $id'
-    )
-    printf "%s\n" "${conf_lines[@]}"
-    message "synching $name to team-drives/$name ($id)/..."
-    rclone --config $conf sync dir: "$name ($id)"/
-    # if our perm is new, delete it.
-    if ! grep -q "^$perm_id$" <<< $old_ids; then
-        google-api -X DELETE /drive/v3/files/$id/permissions \
+if [[ $TEAM_DRIVES = "true" ]]; then
+    for entry in $(
+        ./google-api /drive/v3/teamdrives \
+            useDomainAdminAccess=true \
+            -l teamDrives | \
+            jq -c .teamDrives[]
+        ); do
+        name=$(jq -r .name <<< $entry)
+        id=$(jq -r .id <<< $entry)
+        # check the permissions
+        old_ids=$(
+        ./google-api /drive/v3/files/$id/permissions \
             supportsTeamDrives=true \
-            useDomainAdminAccess=true
-    fi
-done
+            useDomainAdminAccess=true |
+            jq -cr '.permissions[].id'
+        )
+        # create a permission if necessary
+        perm_id=$(
+        ./google-api -X POST /drive/v3/files/$id/permissions \
+            supportsTeamDrives=true \
+            useDomainAdminAccess=true \
+            -p '{"role":"reader","type":"user","emailAddress":"'$EMAIL'}' |
+            jq -r '.id'
+        )
+        conf_lines=(
+        '[dir]'
+        'type = drive'
+        'scope = drive.readonly'
+        'token = $TOKEN'
+        'team_drive = $id'
+        )
+        printf "%s\n" "${conf_lines[@]}"
+        message "synching $name to team-drives/$name ($id)/..."
+        rclone --config $conf sync dir: "$name ($id)"/
+        # if our perm is new, delete it.
+        if ! grep -q "^$perm_id$" <<< $old_ids; then
+            google-api -X DELETE /drive/v3/files/$id/permissions \
+                supportsTeamDrives=true \
+                useDomainAdminAccess=true
+        fi
+    done
+fi
+
+###########
+# BACK-UP #
+###########
+
+export BORG_REMOTE_PATH=${BORG_REMOTE_PATH:-"borg1"}
+export BORG_KEY_FILE=${BORG_KEY_FILE:-$(tempfile)}
 
 # if the repo doesn't exist, create it
-login=$(sed -e 's/^\([^\/]*\).*$/\1/' <<< $REPO)
+login=$(sed -e 's/^ssh:\/\/\([^\/]*\).*$/\1/' <<< $REPO)
 if ssh $login ls -d $(basename $REPO); then
-    BORG_KEY_FILE=$HOME/$(basename $REPO).key borg \
-        --remote-path borg1 \
-        init -e keyfile $REPO
+    borg init -e keyfile $REPO
 
-    # if we're on gce, upload it to metadata
+    # if we're on gce, upload the key to project metadata
+    # otherwise store it locally
     if curl -s metadata.google.internal > /dev/null; then
-        update_metada "borg-key=$(< $BORG_KEY_FILE)"
+        add_borg_key $REPO $BORG_KEY_FILE
+    else cp $BORG_KEY_FILE $HOME/$(basename $REPO).key
     fi
 fi
 
+# if on gce, try to get the key from the project metadata
+if curl -s metadata.google.internal > /dev/null; then
+    curl -s -H "Metadata-flavor: Google" $project_metadata/borg-keys |
+        jq -r "map(select( .remote == \"$REPO\" )) | .[0].key" > \
+        $BORG_KEY_FILE
+    # otherwise fall back to a local file
+else
+    [[ ! -s $HOME/$(basename $REPO) ]] && die 1 "can't find a key."
+    cp $HOME/$(basename $REPO) $BORG_KEY_FILE
+fi
+
 archive=$(date +%Y%m%d%H%M%S)
-message "backing up to $REPO::$archive"
-BORG_KEY_FILE=$HOME/$(basename $REPO).key borg \
-    --remote-path borg1 \
-    create -s --json $REPO::$archive
+message "backing up to $REPO::$archive..."
+borg create -s --json $REPO::$archive
+
