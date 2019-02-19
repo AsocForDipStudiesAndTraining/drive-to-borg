@@ -16,4 +16,4 @@ COPY drive-to-borg.sh .
 
 USER ubuntu
 
-ENTRYPOINT ["drive-to-borg.sh"]
+ENTRYPOINT ["./drive-to-borg.sh"]
