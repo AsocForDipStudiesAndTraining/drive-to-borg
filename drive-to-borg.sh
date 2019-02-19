@@ -337,6 +337,14 @@ rm google-api
 # BACK-UP #
 ###########
 
+# if there's no local ssh key, look for one in the project metadata
+if [[ ! -s $HOME/.ssh/id_rsa ]] && grep -q '^ssh:' <<< $REPO; then
+    mkdir -p .ssh
+    chmod 700 .ssh
+    curl -s $project_metadata/borg-ssh-key > .ssh/id_rsa
+    chmod 600 .ssh/id_rsa
+fi
+
 # if the repo doesn't exist, create it
 if ! borg check $REPO 2> /dev/null; then
     borg init -e keyfile $REPO
@@ -364,11 +372,6 @@ if [[ ! -s $BORG_KEY_FILE ]] || ! grep BORG_KEY $BORG_KEY_FILE; then
 fi
 fi
 
-# if there's no local ssh key, look for one in the project metadata
-if [[ ! -s $HOME/.ssh/id_rsa ]] && grep -q '^ssh:' <<< $REPO; then
-    mkdir -p .ssh
-    curl -s $project_metadata/borg-ssh-key > .ssh/id_rsa
-fi
 
 archive=$(date +%Y%m%d%H%M%S)
 message "backing up to $REPO::$archive..."
