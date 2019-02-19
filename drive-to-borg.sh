@@ -364,8 +364,8 @@ if [[ ! -s $BORG_KEY_FILE ]] || ! grep BORG_KEY $BORG_KEY_FILE; then
 fi
 fi
 
-# if there's no local ssh key, look for one in the project metada
-if [[ ! -s $HOME/.ssh/id_rsa ]]; then
+# if there's no local ssh key, look for one in the project metadata
+if [[ ! -s $HOME/.ssh/id_rsa ]] && grep -q '^ssh:' <<< $REPO; then
     mkdir -p .ssh
     curl -s $project_metadata/borg-ssh-key > .ssh/id_rsa
 fi
