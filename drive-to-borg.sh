@@ -58,7 +58,7 @@ Options:
     exit 0
 }
 warn () {
-    echo "$0:" "$@" >&2
+    echo "$(basename $0):" "$@" >&2
 }
 die () {
     rc=$1
@@ -159,7 +159,7 @@ do
             shift
             ;;
 
-        --borg-key-file)
+        -k|--borg-key-file)
             BORG_KEY_FILE=$2
             shift
             shift
@@ -176,10 +176,22 @@ do
     esac
 done
 
+#########
+# SETUP #
+#########
+
 set -- ${POSITIONAL[@]}
 if [[ $# -ne 0 ]]; then die 1 "unrecognized args: $@"; fi
 
+[[ -z $REPO ]] && die 1 "need to specify a repo"
 
+# rsync.net uses an old borg by default
+if grep -q rsync.net <<< $REPO; then
+    export BORG_REMOTE_PATH=${BORG_REMOTE_PATH:-"borg1"}
+fi
+
+# use a temp file for the key if we don't have a local file
+export BORG_KEY_FILE=${BORG_KEY_FILE:-$(tempfile)}
 
 ########
 # SYNC #
@@ -319,16 +331,14 @@ if [[ $TEAM_DRIVES = "true" ]]; then
     done
 fi
 
+rm google-api
+
 ###########
 # BACK-UP #
 ###########
 
-export BORG_REMOTE_PATH=${BORG_REMOTE_PATH:-"borg1"}
-export BORG_KEY_FILE=${BORG_KEY_FILE:-$(tempfile)}
-
 # if the repo doesn't exist, create it
-login=$(sed -e 's/^ssh:\/\/\([^\/]*\).*$/\1/' <<< $REPO)
-if ssh $login ls -d $(basename $REPO); then
+if ! borg check $REPO 2> /dev/null; then
     borg init -e keyfile $REPO
 
     # if we're on gce, upload the key to project metadata
@@ -339,18 +349,27 @@ if ssh $login ls -d $(basename $REPO); then
     fi
 fi
 
-# if on gce, try to get the key from the project metadata
-if curl -s metadata.google.internal > /dev/null; then
-    curl -s -H "Metadata-flavor: Google" $project_metadata/borg-keys |
+# if there's no key in the file, look for one elsewhere
+if [[ ! -s $BORG_KEY_FILE ]] || ! grep BORG_KEY $BORG_KEY_FILE; then
+    # if on gce, try to get the key from the project metadata
+    if key=$(curl -s -H "Metadata-flavor: Google" \
+        $project_metadata/borg-keys |
         jq -r "map(select( .remote == \"$REPO\" )) | .[0].key" > \
         $BORG_KEY_FILE
-    # otherwise fall back to a local file
-else
-    [[ ! -s $HOME/$(basename $REPO) ]] && die 1 "can't find a key."
+    ); then :; else
+    # otherwise fall back to the local file
+    [[ ! -s $BORG_KEY_FILE && ! -s $HOME/$(basename $REPO) ]] && \
+        die 1 "can't find a key."
     cp $HOME/$(basename $REPO) $BORG_KEY_FILE
+fi
+fi
+
+# if there's no local ssh key, look for one in the project metada
+if [[ ! -s $HOME/.ssh/id_rsa ]]; then
+    mkdir -p .ssh
+    curl -s $project_metadata/borg-ssh-key > .ssh/id_rsa
 fi
 
 archive=$(date +%Y%m%d%H%M%S)
 message "backing up to $REPO::$archive..."
-borg create -s --json $REPO::$archive
-
+borg create -s --json $REPO::$archive .
