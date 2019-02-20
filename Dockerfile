@@ -4,7 +4,9 @@ RUN apt-get update && apt-get install -y \
         borgbackup \
         curl \
         unzip \
-        man-db
+        man-db \
+        ssh \
+        jq
 
 RUN curl https://rclone.org/install.sh | bash
 

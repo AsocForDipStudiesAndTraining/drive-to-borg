@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash`;wqq`
 #
 # drive-to-borg: a simple script to sync google drive folders and
 # team drives, then back them up with borg
@@ -113,14 +113,14 @@ add_borg_key () {
 #########
 
 POSITIONAL=()
-DIRS=()
+
 while [[ $# -gt 0 ]]
 do
     key="$1"
 
     case $key in
         -f|--folder-id)
-            DIRS+=($2)
+            FOLDERS+=($2)
             shift
             shift
             ;;
@@ -185,6 +185,8 @@ if [[ $# -ne 0 ]]; then die 1 "unrecognized args: $@"; fi
 
 [[ -z $REPO ]] && die 1 "need to specify a repo"
 
+proj_metadata="metadata.google.internal/computeMetadata/v1/project/attributes"
+
 # rsync.net uses an old borg by default
 if grep -q rsync.net <<< $REPO; then
     export BORG_REMOTE_PATH=${BORG_REMOTE_PATH:-"borg1"}
@@ -192,6 +194,58 @@ fi
 
 # use a temp file for the key if we don't have a local file
 export BORG_KEY_FILE=${BORG_KEY_FILE:-$(tempfile)}
+
+# stop ssh from sabotaging us with it's sixteen layers of idiot-proofing
+export BORG_RSH="ssh -oStrictHostKeyChecking=no"
+
+# if there's no local ssh key, look for one in the project metadata
+if [[ ! -s $HOME/.ssh/id_rsa ]] && grep -q '^ssh:' <<< $REPO; then
+    mkdir -p $HOME/.ssh
+    chmod 700 $HOME/.ssh
+    curl -sH "Metadata-flavor: Google" \
+        $proj_metadata/borg-ssh-key > $HOME/.ssh/id_rsa
+    chmod 600 $HOME/.ssh/id_rsa
+fi
+
+# let's make sure we have a borg key before we even get started
+if [[ ! -s $BORG_KEY_FILE ]]; then
+    # first look for project metadata
+    code=$(curl --write-out %{http_code} \
+        -sH "Metadata-flavor: Google" \
+        --output /dev/null \
+        "$proj_metadata/borg-keys")
+    # if the server is available and the borg-keys exist
+    if [[ $? -eq 0 && $code -ge 200 && $code -lt 300 ]]; then
+        # we have keys in metadata; see if any match our repo
+        curl -sH "Metadata-flavor: Google" "$proj_metadata/borg-keys" |
+            jq -r "map(select( .remote == \"$REPO\" )) | .[0].key" > \
+            $BORG_KEY_FILE
+    fi
+
+    # if the file is still empty look for a local file
+    if [[ ! -s $BORG_KEY_FILE && -s "$(basename $REPO).key" ]]; then
+        if grep -q "^BORG_KEY" "$(basename $REPO).key"; then
+            cat "$(basename $REPO)" > $BORG_KEY_FILE
+        fi
+    fi
+
+    # if the file is still empty, the repo might not exist.  try making it.
+    if [[ ! -s $BORG_KEY_FILE ]]; then
+        borg init -e keyfile $REPO
+        # if this fails we're stuck
+
+        # if we're on gce, upload the key to project metadata
+        # otherwise store it locally
+        if curl -s metadata.google.internal > /dev/null; then
+            add_borg_key $REPO $BORG_KEY_FILE
+        else cp $BORG_KEY_FILE $HOME/$(basename $REPO).key
+        fi
+    fi
+fi
+
+# move into the drive directory
+mkdir -p $HOME/drive
+cd $HOME/drive
 
 ########
 # SYNC #
@@ -206,7 +260,6 @@ fi
 
 # if we're running on a google compute instance, the TOKEN might be in the
 # project metadata
-proj_metadata="metadata.google.internal/computeMetadata/v1/project/attributes"
 if [[ -z $TOKEN ]] && curl -s metadata.google.internal > /dev/null; then
     TOKEN=$(curl -s $proj_metadata/rclone-token \
         -H "Metadata-flavor: Google")
@@ -222,8 +275,8 @@ if [[ ! -x google-api ]]; then
 fi
 
 # folders
-if [[ ${#DIRS[@]} -gt 0 ]]; then
-    for id in $DIRS; do
+if [[ ${#FOLDERS[@]} -gt 0 ]]; then
+    for id in $FOLDERS; do
         # check if we are a team drive
         if [[ $(./google-api /drive/v3/files/$id supportsTeamDrives=true |
             jq -r '.teamDriveId != null') = "true" ]]; then
@@ -336,41 +389,6 @@ rm google-api
 ###########
 # BACK-UP #
 ###########
-
-# if there's no local ssh key, look for one in the project metadata
-if [[ ! -s $HOME/.ssh/id_rsa ]] && grep -q '^ssh:' <<< $REPO; then
-    mkdir -p .ssh
-    chmod 700 .ssh
-    curl -s $project_metadata/borg-ssh-key > .ssh/id_rsa
-    chmod 600 .ssh/id_rsa
-fi
-
-# if the repo doesn't exist, create it
-if ! borg check $REPO 2> /dev/null; then
-    borg init -e keyfile $REPO
-
-    # if we're on gce, upload the key to project metadata
-    # otherwise store it locally
-    if curl -s metadata.google.internal > /dev/null; then
-        add_borg_key $REPO $BORG_KEY_FILE
-    else cp $BORG_KEY_FILE $HOME/$(basename $REPO).key
-    fi
-fi
-
-# if there's no key in the file, look for one elsewhere
-if [[ ! -s $BORG_KEY_FILE ]] || ! grep BORG_KEY $BORG_KEY_FILE; then
-    # if on gce, try to get the key from the project metadata
-    if key=$(curl -s -H "Metadata-flavor: Google" \
-        $project_metadata/borg-keys |
-        jq -r "map(select( .remote == \"$REPO\" )) | .[0].key" > \
-        $BORG_KEY_FILE
-    ); then :; else
-    # otherwise fall back to the local file
-    [[ ! -s $BORG_KEY_FILE && ! -s $HOME/$(basename $REPO) ]] && \
-        die 1 "can't find a key."
-    cp $HOME/$(basename $REPO) $BORG_KEY_FILE
-fi
-fi
 
 
 archive=$(date +%Y%m%d%H%M%S)
